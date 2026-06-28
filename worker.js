@@ -20,7 +20,7 @@ export default {
 
     if (request.method === 'OPTIONS') return new Response(null, { headers: jsonHeaders });
 
-    // --- [CRITICAL-2 FIX]: Authentication Gate (helper - used for POST only) ---
+    // --- [CRITICAL-2 FIX]: Authentication Gate (helper) ---
     async function safeCompare(a, b) {
         if (!a || !b) return false;
         const enc = new TextEncoder();
@@ -85,16 +85,16 @@ export default {
       }
     }
 
-    if (request.method === 'POST') {
-      // --- [AUDIT FIX #2]: POST-only Authentication Gate ---
-      const authHeader = request.headers.get('Authorization');
-      const expectedKey = env.STS_API_KEY;
-      if (expectedKey && !(await safeCompare(authHeader || '', `Bearer ${expectedKey}`))) {
-          return new Response(JSON.stringify({ status: 'error', message: 'Unauthorized Access' }), {
-              headers: jsonHeaders, status: 401
-          });
-      }
+    // --- [CRITICAL FIX]: Auth gate now runs for GET *and* POST ---
+    const authHeader = request.headers.get('Authorization');
+    const expectedKey = env.STS_API_KEY;
+    if (expectedKey && !(await safeCompare(authHeader || '', `Bearer ${expectedKey}`))) {
+        return new Response(JSON.stringify({ status: 'error', message: 'Unauthorized Access' }), {
+            headers: jsonHeaders, status: 401
+        });
+    }
 
+    if (request.method === 'POST') {
       // --- [MEDIUM-5 FIX]: Overall Payload Size Limit (5MB) ---
       const bodyText = await request.text();
       if (bodyText.length > 5 * 1024 * 1024) { 
@@ -138,7 +138,7 @@ export default {
          // [MEDIUM-2 & HIGH-1 FIX]
          ctx.waitUntil(
              fetch(env.GOOGLE_SCRIPT_URL, { method: 'POST',
-                body: JSON.stringify({ action: "SEND_OTP_ONLY", emails: data.emails, otp: otp }) })
+                body: JSON.stringify({ action: "SEND_OTP_ONLY", emails: data.emails, otp: otp, secret: env.GAS_SHARED_SECRET }) })
                 .catch(err => console.error("OTP email send failed:", err))
          );
          return new Response(JSON.stringify({ status: "success" }), { headers: jsonHeaders });
@@ -151,7 +151,9 @@ export default {
       // 📩 ১. OTP পাঠানোর API (Cloudflare -> App Script)
       if (data.action === "SEND_REGISTRATION_OTP") {
         try {
-            let otp = Math.floor(100000 + Math.random() * 900000).toString(); 
+            const otpBuf = new Uint32Array(1);
+            crypto.getRandomValues(otpBuf);
+            let otp = String(100000 + (otpBuf[0] % 900000));
             
             await env.DB.prepare(`CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)`).run();
             await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('BIO_REG_OTP', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").bind(otp).run();
@@ -160,7 +162,7 @@ export default {
             let emailText = `Your STS App Fingerprint Registration OTP is: ${otp}.\nDo not share this with anyone!`;
             await fetch(APP_SCRIPT_URL, {
                 method: "POST",
-                body: JSON.stringify({ action: "SEND_ALERT_EMAIL", email: ADMIN_EMAIL, subject: "STS Security OTP", message: emailText })
+                body: JSON.stringify({ action: "SEND_ALERT_EMAIL", email: ADMIN_EMAIL, subject: "STS Security OTP", message: emailText, secret: env.GAS_SHARED_SECRET })
             });
             
             return new Response(JSON.stringify({ status: "success" }), { headers: jsonHeaders });
@@ -171,16 +173,25 @@ export default {
       // 🔐 ২. OTP ভেরিফাই ও অ্যালার্ট পাঠানোর API (Cloudflare -> App Script)
       if (data.action === "REGISTER_BIOMETRIC") {
         try {
+            // --- [CRITICAL FIX]: Lockout for OTP guesses ---
+            const bioAttemptsKey = "BIO_REG_ATTEMPTS";
+            const bioAttempts = parseInt(await env.STS_DB.get(bioAttemptsKey) || "0");
+            if (bioAttempts >= 5) {
+                return new Response(JSON.stringify({ status: "error", message: "Too many attempts. Request a new OTP." }), { headers: jsonHeaders, status: 429 });
+            }
+
             let otpRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'BIO_REG_OTP'").first();
             if(!otpRow || otpRow.value !== data.otp) {
+                await env.STS_DB.put(bioAttemptsKey, String(bioAttempts + 1), { expirationTtl: 600 });
                 return new Response(JSON.stringify({ status: "error", message: "Invalid or Expired OTP!" }), { headers: jsonHeaders, status: 401 });
             }
+            await env.STS_DB.delete(bioAttemptsKey).catch(()=>{});
 
             await env.DB.prepare("DELETE FROM settings WHERE key = 'BIO_REG_OTP'").run();
 
             let ip = request.headers.get('CF-Connecting-IP') || 'Unknown IP';
             let location = (request.cf && request.cf.city ? request.cf.city : '') + ', ' + (request.cf && request.cf.country ? request.cf.country : '');
-            let deviceName = data.device_name || 'Unknown Device'; 
+            let deviceName = (data.device_name || 'Unknown Device').toString().slice(0, 60).replace(/[<>]/g, ''); 
 
             await env.DB.prepare(`CREATE TABLE IF NOT EXISTS active_devices (id INTEGER PRIMARY KEY AUTOINCREMENT, device_name TEXT, credential_id TEXT, ip_address TEXT, location TEXT, reg_date DATETIME DEFAULT CURRENT_TIMESTAMP)`).run();
             
@@ -195,7 +206,7 @@ export default {
             
             fetch(APP_SCRIPT_URL, {
                 method: "POST",
-                body: JSON.stringify({ action: "SEND_ALERT_EMAIL", email: ADMIN_EMAIL, subject: "⚠️ New Device Registered!", message: alertMsg })
+                body: JSON.stringify({ action: "SEND_ALERT_EMAIL", email: ADMIN_EMAIL, subject: "⚠️ New Device Registered!", message: alertMsg, secret: env.GAS_SHARED_SECRET })
             }).catch(e => console.log("Alert email failed."));
 
             return new Response(JSON.stringify({ status: "success" }), { headers: jsonHeaders });
@@ -273,7 +284,7 @@ export default {
          // [MEDIUM-2 & HIGH-1 FIX]
          ctx.waitUntil(
              fetch(env.GOOGLE_SCRIPT_URL, { method: 'POST', 
-                body: JSON.stringify(data) })
+                body: JSON.stringify({ ...data, secret: env.GAS_SHARED_SECRET }) })
              .catch(err => console.error("On-demand statement failed:", err))
          );
          return new Response(JSON.stringify({ status: "success" }), { headers: jsonHeaders });
@@ -332,7 +343,7 @@ export default {
                   if (editDate < todayIso) {
                       const { results: updatedTx } = await env.DB.prepare("SELECT * FROM transactions WHERE date = ?").bind(editDate).all();
                       const { results: updatedDenom } = await env.DB.prepare("SELECT * FROM denominations WHERE date = ?").bind(editDate).all();
-                      await fetch(env.GOOGLE_SCRIPT_URL, { method: "POST", body: JSON.stringify({ action: "DAILY_BACKUP_SYNC", date: editDate, transactions: updatedTx, denominations: updatedDenom }) }).catch(e => console.error(e));
+                      await fetch(env.GOOGLE_SCRIPT_URL, { method: "POST", body: JSON.stringify({ action: "DAILY_BACKUP_SYNC", date: editDate, transactions: updatedTx, denominations: updatedDenom, secret: env.GAS_SHARED_SECRET }) }).catch(e => console.error(e));
                   }
               }
           } catch(err) {
@@ -368,7 +379,7 @@ export default {
               const { results: tResults } = await env.DB.prepare("SELECT * FROM transactions WHERE date = ?").bind(targetIsoDate).all();
               const { results: dResults } = await env.DB.prepare("SELECT * FROM denominations WHERE date = ?").bind(targetIsoDate).all();
               if (tResults && tResults.length > 0) {
-                  await fetch(env.GOOGLE_SCRIPT_URL, { method: "POST", body: JSON.stringify({ action: "DAILY_BACKUP_SYNC", date: targetIsoDate, transactions: tResults, denominations: dResults }) }).catch(e=>console.error(e));
+                  await fetch(env.GOOGLE_SCRIPT_URL, { method: "POST", body: JSON.stringify({ action: "DAILY_BACKUP_SYNC", date: targetIsoDate, transactions: tResults, denominations: dResults, secret: env.GAS_SHARED_SECRET }) }).catch(e=>console.error(e));
               }
           }
       }
@@ -418,14 +429,15 @@ export default {
 
              if (shouldSend) {
                  const { results } = await env.DB.prepare("SELECT * FROM transactions WHERE date >= ? AND date <= ? ORDER BY date ASC, id ASC").bind(startDateIso, endDateIso).all();
-                 await fetch("https://sts-pdf-server-1012055640452.asia-south1.run.app/auto-generate", {
+                 await fetch(env.GOOGLE_SCRIPT_URL, {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({
                        action: "SEND_CRON_SUMMARY",
-                       emails: config.email,
-                       dateRange: reportLabel,
-                       ledgerData: results 
+                       email: config.email,
+                       date: reportLabel,
+                       data: results,
+                       secret: env.GAS_SHARED_SECRET
                     })
                  }).catch(e => console.error("Cron email failed:", e));
              }
