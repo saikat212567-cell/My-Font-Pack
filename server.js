@@ -41,8 +41,20 @@ async function getBrowser() {
 
 
 
+const PDF_API_KEY = process.env.STS_API_KEY || "";
+
 app.post('/generate-pdf', async (req, res) => {
+    // --- [CRITICAL FIX]: Require shared secret ---
+    const authHeader = req.headers['authorization'] || '';
+    if (PDF_API_KEY && authHeader !== `Bearer ${PDF_API_KEY}`) {
+        return res.status(401).json({ status: 'error', message: 'Unauthorized Access' });
+    }
+
     const data = req.body;
+    // --- [CRITICAL FIX]: Block non-data: image sources (kills SSRF via <img src>) ---
+    if (typeof data.qrCode !== 'string' || !data.qrCode.startsWith('data:image/')) {
+        data.qrCode = '';
+    }
     let page = null;
 
     const htmlTemplate = `
@@ -369,6 +381,8 @@ app.post('/generate-pdf', async (req, res) => {
         console.log("Generating High Quality PDF on Cloud Run...");
         const browser = await getBrowser();
         page = await browser.newPage();
+        // --- [CRITICAL FIX]: PDFs only need static HTML/CSS — no scripting required ---
+        await page.setJavaScriptEnabled(false);
         page.setDefaultNavigationTimeout(30000); // 30s navigation timeout
         page.setDefaultTimeout(30000); // 30s operation timeout
 
