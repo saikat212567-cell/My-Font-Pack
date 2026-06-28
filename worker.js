@@ -5,7 +5,8 @@ export default {
   async fetch(request, env, ctx) {
     // --- [CRITICAL-1 FIX]: Restrict CORS Origins ---
     const ALLOWED_ORIGINS = [
-        'https://sankar-tea-shop.saikat212567.workers.dev/'
+        'https://sankar-tea-shop.saikat212567.workers.dev'
+    ];
     const origin = request.headers.get('Origin') || '';
     const corsOrigin = ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0];
 
@@ -13,18 +14,24 @@ export default {
       'Access-Control-Allow-Origin': corsOrigin,
       'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-      'Content-Type': 'application/json'
+      'Content-Type': 'application/json',
+      'Vary': 'Origin'
     };
 
     if (request.method === 'OPTIONS') return new Response(null, { headers: jsonHeaders });
 
-    // --- [CRITICAL-2 FIX]: Authentication Gate ---
-    const authHeader = request.headers.get('Authorization');
-    const expectedKey = env.STS_API_KEY; 
-    if (!authHeader || authHeader !== `Bearer ${expectedKey}`) {
-        return new Response(JSON.stringify({ status: 'error', message: 'Unauthorized Access' }), { 
-            headers: jsonHeaders, status: 401 
-        });
+    // --- [CRITICAL-2 FIX]: Authentication Gate (helper - used for POST only) ---
+    async function safeCompare(a, b) {
+        if (!a || !b) return false;
+        const enc = new TextEncoder();
+        const keyA = await crypto.subtle.importKey('raw', enc.encode(a), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+        const sigA = new Uint8Array(await crypto.subtle.sign('HMAC', keyA, enc.encode('auth')));
+        const keyB = await crypto.subtle.importKey('raw', enc.encode(b), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+        const sigB = new Uint8Array(await crypto.subtle.sign('HMAC', keyB, enc.encode('auth')));
+        if (sigA.length !== sigB.length) return false;
+        let diff = 0;
+        for (let i = 0; i < sigA.length; i++) diff |= sigA[i] ^ sigB[i];
+        return diff === 0;
     }
 
     // --- [HIGH-2 & HIGH-3 FIX]: Input Validation Helpers ---
@@ -79,6 +86,15 @@ export default {
     }
 
     if (request.method === 'POST') {
+      // --- [AUDIT FIX #2]: POST-only Authentication Gate ---
+      const authHeader = request.headers.get('Authorization');
+      const expectedKey = env.STS_API_KEY;
+      if (expectedKey && !(await safeCompare(authHeader || '', `Bearer ${expectedKey}`))) {
+          return new Response(JSON.stringify({ status: 'error', message: 'Unauthorized Access' }), {
+              headers: jsonHeaders, status: 401
+          });
+      }
+
       // --- [MEDIUM-5 FIX]: Overall Payload Size Limit (5MB) ---
       const bodyText = await request.text();
       if (bodyText.length > 5 * 1024 * 1024) { 
@@ -114,13 +130,16 @@ export default {
          }
          await env.STS_DB.put(rateLimitKey, String(attempts + 1), { expirationTtl: 600 });
 
-         const otp = Math.floor(100000 + Math.random() * 900000).toString();
+         const otpBuffer = new Uint32Array(1);
+         crypto.getRandomValues(otpBuffer);
+         const otp = String(100000 + (otpBuffer[0] % 900000));
          await env.STS_DB.put(`OTP_${data.emails}`, otp, { expirationTtl: 600 }); 
          
          // [MEDIUM-2 & HIGH-1 FIX]
          ctx.waitUntil(
-             fetch(env.GOOGLE_SCRIPT_URL, { method: 'POST', body: JSON.stringify({ action: "SEND_OTP_ONLY", emails: data.emails, otp: otp }) })
-             .catch(err => console.error("OTP email send failed:", err))
+             fetch(env.GOOGLE_SCRIPT_URL, { method: 'POST',
+                body: JSON.stringify({ action: "SEND_OTP_ONLY", emails: data.emails, otp: otp }) })
+                .catch(err => console.error("OTP email send failed:", err))
          );
          return new Response(JSON.stringify({ status: "success" }), { headers: jsonHeaders });
       }
@@ -145,6 +164,10 @@ export default {
          } catch(e) { existingArr = []; }
 
          existingArr = existingArr.filter(c => c.email !== data.config.email);
+         // --- [AUDIT FIX #5]: Cap email config array at 20 entries ---
+         if (existingArr.length >= 20) {
+             return new Response(JSON.stringify({ status: "error", message: "Maximum 20 email schedules allowed" }), { headers: jsonHeaders, status: 400 });
+         }
          existingArr.push(data.config);
          await env.STS_DB.put("SCHEDULED_EMAILS", JSON.stringify(existingArr));
          return new Response(JSON.stringify({ status: "success" }), { headers: jsonHeaders });
@@ -175,10 +198,16 @@ export default {
       if (data.action === "SEND_ON_DEMAND_STATEMENT") {
          // [MEDIUM-2 & HIGH-1 FIX]
          ctx.waitUntil(
-             fetch(env.GOOGLE_SCRIPT_URL, { method: 'POST', body: JSON.stringify(data) })
+             fetch(env.GOOGLE_SCRIPT_URL, { method: 'POST', 
+                body: JSON.stringify(data) })
              .catch(err => console.error("On-demand statement failed:", err))
          );
          return new Response(JSON.stringify({ status: "success" }), { headers: jsonHeaders });
+      }
+
+      // --- [AUDIT FIX #10]: Reject unknown action values ---
+      if (data.action) {
+          return new Response(JSON.stringify({ status: "error", message: "Unknown action" }), { headers: jsonHeaders, status: 400 });
       }
 
       let items = Array.isArray(data) ? data : [data];
