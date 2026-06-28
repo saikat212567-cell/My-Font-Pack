@@ -170,6 +170,19 @@
     </div>
   </div>
 </div>
+    <div id="otpModal" class="modal-overlay">
+        <div class="modal-content">
+            <h3 class="modal-title">🔒 ENTER OTP</h3>
+            <p class="modal-desc">We've sent a 6-digit secure code to your Email.</p>
+            
+            <input type="number" id="otpInput" class="pin-input" placeholder="• • • • • •" oninput="if(this.value.length > 6) this.value = this.value.slice(0,6);">
+            
+            <div class="modal-btn-row">
+                <button onclick="closeOtpModal()" class="modal-btn btn-cancel">CANCEL</button>
+                <button onclick="submitOtpModal()" class="modal-btn btn-unlock">VERIFY</button>
+            </div>
+        </div>
+    </div>
 
 <div class="console-card">
  <button type="button" class="btn-top-settings" onclick="triggerSettingsPin()" title="System Settings">
@@ -422,6 +435,18 @@
       <div class="form-group"><input type="password" id="confirmNewPinInput" placeholder="Confirm New PIN" inputmode="numeric" maxlength="6"></div>
       <button type="button" class="submit-btn" style="background: #9C27B0; padding: 10px;" onclick="saveNewPin()">UPDATE PIN</button>
     </div>
+      <div class="settings-section">
+      <h4> Biometric Security</h4>
+      <button type="button" class="submit-btn" style="background: #28a745; padding: 10px;" onclick="setupSTSBiometric()">REGISTER FINGERPRINT</button>
+   <div class="settings-section" style="margin-top: 20px;">
+      <h4>📱 Active Devices (Security)</h4>
+      <button type="button" class="btn" style="background: #17a2b8; color: white; width: 100%; padding: 10px;" onclick="loadDeviceLogs()">
+         View & Manage Devices
+      </button>
+      
+      <div id="deviceLogContainer" style="display: none; text-align: left; background: #141414; padding: 15px; border-radius: 8px; border: 2px solid #444; max-height: 300px; overflow-y: auto; margin-top: 15px; color: #fff;">
+      </div>
+    </div>
 
     <div class="settings-section">
       <h4>📧 Scheduled Statements</h4>
@@ -564,8 +589,16 @@
       }
   }
   
-  function triggerSettingsPin() {
+ async function triggerSettingsPin() {
       if (!systemPinHash) { toggleViews('settings'); return; }
+      
+      // আগে ফিঙ্গারপ্রিন্ট ট্রাই করবে
+      let unlocked = await tryBiometricUnlock(() => {
+          toggleViews('settings');
+      });
+      if (unlocked) return; // ফিঙ্গারপ্রিন্ট মিলে গেলে এখানেই কাজ শেষ!
+
+      // ফিঙ্গারপ্রিন্ট না দিলে পুরনো PIN চাইবে
       document.getElementById('pinDesc').innerText = "Enter PIN to access Settings.";
       pendingTargetDate = "SETTINGS";
       document.getElementById('pinInput').value = "";
@@ -573,9 +606,20 @@
       setTimeout(() => document.getElementById('pinInput').focus(), 100);
   }
 
-  function onUserDateChange(el) {
+  async function onUserDateChange(el) {
       let selected = el.value;
       if (selected < currentIsoDate && systemPinHash) {
+          
+          // আগে ফিঙ্গারপ্রিন্ট ট্রাই করবে
+          let unlocked = await tryBiometricUnlock(() => {
+              authorizedInputDate = selected;
+              let dateEl = document.getElementById('dateField');
+              dateEl.value = selected;
+              executeDateChange(dateEl, selected);
+          });
+          if (unlocked) return; // ফিঙ্গারপ্রিন্ট মিলে গেলে এখানেই কাজ শেষ!
+
+          // ফিঙ্গারপ্রিন্ট না দিলে পুরনো PIN চাইবে
           pendingTargetDate = selected;
           document.getElementById('pinDesc').innerText = `Enter PIN to edit ${toDDMMYYYY(selected)}`;
           document.getElementById('pinInput').value = "";
@@ -1857,6 +1901,212 @@ function requestEmailStatement() {
         alert("Email Generation Error: " + e.message);
         console.error(e);
     });
+}
+    // --- BIOMETRIC UNLOCK SYSTEM ---
+function buf2base64(buf) {
+    return btoa(String.fromCharCode.apply(null, new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+}
+function base642buf(b64) {
+    let b = atob((b64 + '='.repeat((4 - b64.length % 4) % 4)).replace(/-/g, '+').replace(/_/g, '/'));
+    let buf = new Uint8Array(b.length);
+    for (let i = 0; i < b.length; i++) buf[i] = b.charCodeAt(i);
+    return buf.buffer;
+}
+
+// 📱 অটোমেটিক ডিভাইসের নাম (Model) বের করার ম্যাজিক ফাংশন
+async function getDeviceName() {
+    let dName = "Android Device"; // ডিফল্ট নাম
+    try {
+        // নতুন আধুনিক ফোনের জন্য (Client Hints API)
+        if (navigator.userAgentData) {
+            let hints = await navigator.userAgentData.getHighEntropyValues(['model', 'brand']);
+            if (hints.model) return (hints.brand ? hints.brand + " " : "") + hints.model; // উদাহরণ: "Xiaomi M2104K10I" (POCO F3 GT)
+        } 
+        // পুরনো ফোনের জন্য (User-Agent Parsing)
+        let ua = navigator.userAgent;
+        if (ua.includes("Android")) {
+            let match = ua.match(/Android.*?; (.*?) Build/);
+            if (match && match[1]) return match[1]; // উদাহরণ: "POCO F3 GT"
+        } else if (ua.includes("iPhone")) {
+            return "Apple iPhone";
+        }
+    } catch(e) {}
+    return dName;
+}
+
+// 🔐 ফিঙ্গারপ্রিন্ট সেটআপ (OTP + Auto Device Name)
+async function setupSTSBiometric() {
+    try {
+        // ১. ব্যাকএন্ডকে বলো ইমেইলে OTP পাঠাতে
+        alert("Sending OTP to your Email...");
+        let otpRes = await fetch(WEB_APP_URL, { method: 'POST', headers: authHeaders(), body: JSON.stringify({ action: "SEND_REGISTRATION_OTP" }) });
+        let otpData = await otpRes.json();
+        if(otpData.status !== 'success') throw new Error("Failed to send OTP");
+
+        // ২. ইউজারের কাছে OTP জানতে চাও
+        // ২. সুন্দর Modal দিয়ে ইউজারের কাছে OTP জানতে চাও
+        let userOtp = await showCustomOtpModal();
+        if(!userOtp) return; // ক্যানসেল করলে ব্যাক করবে
+        // ৩. অটোমেটিক ডিভাইসের নাম বের করো (No manual typing!)
+        let dName = await getDeviceName(); 
+
+        // ৪. স্ক্যানার চালু করো
+        const opt = {
+            challenge: crypto.getRandomValues(new Uint8Array(32)),
+            rp: { name: "Sankar Tea Shop" },
+            user: { id: crypto.getRandomValues(new Uint8Array(16)), name: "admin", displayName: "STS Admin" },
+            pubKeyCredParams: [{alg: -7, type: "public-key"}],
+            authenticatorSelection: { authenticatorAttachment: "platform", userVerification: "required" },
+            timeout: 60000
+        };
+        const cred = await navigator.credentials.create({ publicKey: opt });
+        const cid = buf2base64(cred.rawId);
+
+        // ৫. OTP, ডিভাইসের নাম এবং চাবি ব্যাকএন্ডে পাঠাও
+        let res = await fetch(WEB_APP_URL, {
+            method: 'POST', headers: authHeaders(),
+            body: JSON.stringify({ action: "REGISTER_BIOMETRIC", credential_id: cid, device_name: dName, otp: userOtp })
+        });
+        
+        let data = await res.json();
+        if(data.status === 'success') {
+            localStorage.setItem('sts_bio_id', cid);
+            alert(`✅ Device '${dName}' Registered Successfully!`);
+            loadDeviceLogs(); // লিস্টটা আপডেট হবে
+        } else {
+            alert("❌ Registration Failed: " + data.message); // ভুল OTP দিলে এখানে আটকাবে
+        }
+    } catch(e) { alert("Registration Cancelled!"); }
+}
+
+// ৩. The Ultimate Fast & Secure Biometric Unlock (Optimistic UI)
+async function tryBiometricUnlock(successCallback) {
+    let cid = localStorage.getItem('sts_bio_id');
+    if(!cid) return false;
+
+    try {
+        const opt = {
+            challenge: crypto.getRandomValues(new Uint8Array(32)),
+            allowCredentials: [{ id: base642buf(cid), type: 'public-key' }],
+            userVerification: "required", timeout: 60000
+        };
+        
+        // ১. Hardware scan (0.1 second lagbe)
+        const assertion = await navigator.credentials.get({ publicKey: opt });
+        
+        if (assertion) {
+            // ২. INSTANT UNLOCK - kono wait charai sathe sathe UI khule jabe!
+            successCallback();
+
+            // ৩. BACKGROUND SECURITY CHECK (Gopone server-e check hobe)
+            fetch(WEB_APP_URL, {
+                method: 'POST', 
+                headers: authHeaders(),
+                body: JSON.stringify({ action: "VERIFY_BIOMETRIC", credential_id: buf2base64(assertion.rawId) })
+            }).then(res => res.json()).then(data => {
+                if(data.status !== 'success') {
+                    // Hacker dhora pore geche! Sathe sathe app lock kore dao.
+                    console.error("Security Breach Detected!");
+                    alert("⚠️ Unauthorized Access Detected! App is locking down.");
+                    window.location.reload(); // App auto-reload hoye jabe
+                }
+            }).catch(e => console.log("Background check skipped due to network."));
+
+            return true;
+        }
+    } catch(e) { 
+        console.log("Biometric fallback to PIN."); 
+    }
+    
+    return false;
+}
+   // ১. ডিভাইস লগ লোড করার ফাংশন
+// ১. ডিভাইস লগ লোড করার ফাংশন (Dark Theme)
+async function loadDeviceLogs() {
+    const container = document.getElementById('deviceLogContainer');
+    container.style.display = "block";
+    container.innerHTML = "<p style='text-align: center; color: #FF9800;'>⏳ Loading active devices...</p>";
+
+    try {
+        let res = await fetch(WEB_APP_URL, { method: 'POST', headers: authHeaders(), body: JSON.stringify({ action: "GET_DEVICES" }) });
+        let data = await res.json();
+        
+        if (data.status === 'success') {
+            if (data.devices.length === 0) { container.innerHTML = "<p style='text-align: center; color: #aaa;'>No devices registered yet.</p>"; return; }
+            
+            let html = "";
+            data.devices.forEach(dev => {
+                html += `<div style="background: #2a2a2a; border: 1px solid #444; border-radius: 8px; padding: 12px; margin-bottom: 12px; transition: 0.3s;">
+                    <strong style="color:#FF9800; font-size: 16px; font-family: 'Navi Headline', sans-serif;">📱 ${dev.device_name}</strong> <br>
+                    <small style="color:#ccc; display: block; margin-top: 5px;">📍 Location: ${dev.location}</small>
+                    <small style="color:#ccc; display: block;">🌐 IP: ${dev.ip_address}</small>
+                    <small style="color:#888; display: block; margin-bottom: 10px;">🕒 ${new Date(dev.reg_date).toLocaleString()}</small>
+                    <button onclick="revokeDevice(${dev.id})" style="background: #dc3545; color: white; border: none; padding: 8px; border-radius: 6px; cursor: pointer; width: 100%; font-weight: 600; font-family: 'Navi Body', sans-serif;">
+                        🗑️ REVOKE ACCESS
+                    </button>
+                </div>`;
+            });
+            container.innerHTML = html;
+        } else {
+            container.innerHTML = "<p style='text-align: center; color: #dc3545;'>❌ Error loading data.</p>";
+        }
+    } catch(e) { container.innerHTML = "<p style='text-align: center; color: #dc3545;'>❌ Failed to load logs.</p>"; }
+}
+
+// ২. আননোন ডিভাইস ব্লক/রিমুভ করার ফাংশন
+async function revokeDevice(id) {
+    if(!confirm("⚠️ Are you sure? This device will be PERMANENTLY BLOCKED!")) return;
+
+    try {
+        let res = await fetch(WEB_APP_URL, { method: 'POST', headers: authHeaders(), body: JSON.stringify({ action: "REVOKE_DEVICE", device_id: id }) });
+        let data = await res.json();
+        if(data.status === 'success') {
+            alert("✅ Hacker Device Revoked!");
+            loadDeviceLogs(); // কিক-আউট করার পর লিস্ট রিফ্রেশ
+        }
+    } catch(e) { alert("Error revoking device."); }
+}
+
+// ২. আননোন ডিভাইস ব্লক/রিমুভ করার ফাংশন
+async function revokeDevice(id) {
+    if(!confirm("⚠️ Are you sure? This device will be PERMANENTLY BLOCKED from unlocking the app!")) return;
+
+    try {
+        let res = await fetch(WEB_APP_URL, { method: 'POST', headers: authHeaders(), body: JSON.stringify({ action: "REVOKE_DEVICE", device_id: id }) });
+        let data = await res.json();
+        if(data.status === 'success') {
+            alert("✅ Hacker Device successfully revoked and blocked!");
+            loadDeviceLogs(); // কিক-আউট করার পর লিস্টটা আবার রিফ্রেশ করবে
+        }
+    } catch(e) { alert("Error revoking device."); }
+} 
+    // 📩 OTP Modal Logic (Promise based)
+let otpPromiseResolver = null;
+
+function showCustomOtpModal() {
+    document.getElementById('otpInput').value = ""; 
+    document.getElementById('otpModal').style.display = "flex";
+    setTimeout(() => document.getElementById('otpInput').focus(), 100); // অটোমেটিক কীবোর্ড ওপেন হবে
+    
+    // কোড এখানে ওয়েট করবে যতক্ষণ না ইউজার Verify বা Cancel বাটনে ক্লিক করছে
+    return new Promise((resolve) => {
+        otpPromiseResolver = resolve;
+    });
+}
+
+function submitOtpModal() {
+    let otp = document.getElementById('otpInput').value;
+    if (otp.length === 6) {
+        document.getElementById('otpModal').style.display = "none";
+        if (otpPromiseResolver) otpPromiseResolver(otp); // OTP টা মেইন ফাংশনে পাঠিয়ে দেবে
+    } else {
+        alert("⚠️ Please enter a valid 6-digit OTP.");
+    }
+}
+
+function closeOtpModal() {
+    document.getElementById('otpModal').style.display = "none";
+    if (otpPromiseResolver) otpPromiseResolver(null); // ক্যান্সেল করলে Null পাঠাবে
 }
 </script>
 </body>
