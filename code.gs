@@ -1,6 +1,13 @@
 function doPost(e) {
   try {
     var data = JSON.parse(e.postData.contents);
+
+    // --- [HIGH FIX]: Shared-secret check ---
+    var GAS_SHARED_SECRET = "66d75115c85d6d3a1eb735ef75f7aafe3fb3dd7fe31f3d0c06c6cc93595e2a7b13329b1e3961ee25957df3360d217b17";
+    if (data.secret !== GAS_SHARED_SECRET) {
+      return ContentService.createTextOutput(JSON.stringify({status: "error", message: "Unauthorized"})).setMimeType(ContentService.MimeType.JSON);
+    }
+
     var action = data.action;
     // Cloudflare থেকে email প্যারামিটারটা আসবে, তাই সেটা চেক করছি
     var emails = data.emails || data.email; 
